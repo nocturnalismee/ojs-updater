@@ -2,10 +2,10 @@
 /**
  * --
  *  OJS Core Updater / Reinstaller
- *  Versi: 1.0.0
- *  Versi: 1.0.0
- *  Deskripsi: Script untuk update atau reinstall OJS core
- *             tanpa menghilangkan data yang sudah ada.
+ *  Author: Arief
+ *  Versi : 1.0.0
+ *  Repo  : https://github.com/nocturnalismee/ojs-updater
+ *  Deskripsi: Script php untuk update atau reinstall OJS core, tanpa menghapus data OJS.
  *
  *  PERINGATAN KEAMANAN:
  *  - Hapus script ini setelah selesai digunakan!
