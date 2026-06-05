@@ -1,28 +1,30 @@
 <?php
 /**
- * --
+ * ============================================================
  *  OJS Core Updater / Reinstaller
- *  Author: Arief
- *  Versi : 1.0.0
- *  Repo  : https://github.com/nocturnalismee/ojs-updater
- *  Deskripsi: Script php untuk update atau reinstall OJS core, tanpa menghapus data OJS.
+ *  Versi: 1.0.0
+ *  Deskripsi: Script untuk update atau reinstall OJS core
+ *             tanpa menghilangkan data yang sudah ada.
  *
  *  PERINGATAN KEAMANAN:
  *  - Hapus script ini setelah selesai digunakan!
  *  - Pastikan hanya diakses oleh administrator!
- * ---
+ *  - Disarankan menggunakan HTTPS
+ * ============================================================
  */
 
+// ============================================================
 // KONFIGURASI - Sesuaikan sebelum dijalankan
+// ============================================================
+define('SCRIPT_PASSWORD',   'ganti_password_anda');       // Password untuk mengakses script ini
+define('OJS_ROOT',          dirname(__FILE__));            // Root instalasi OJS (ubah jika perlu)
+define('BACKUP_BASE_DIR',   '/tmp');                       // Direktori untuk menyimpan backup sementara
+define('MAX_EXEC_SECONDS',  600);                          // Batas waktu eksekusi (detik)
+define('OJS_DOWNLOAD_BASE', 'https://pkp.sfu.ca/ojs/download/'); // URL dasar download OJS
 
-define('SCRIPT_PASSWORD',   'ganti_password_anda');                       // Password untuk mengakses script ini
-define('OJS_ROOT',          dirname(__FILE__));                           // Root instalasi OJS (ubah jika perlu)
-define('BACKUP_BASE_DIR',   '/tmp');                                      // Direktori untuk menyimpan backup sementara
-define('MAX_EXEC_SECONDS',  600);                                         // Batas waktu eksekusi (detik)
-define('OJS_DOWNLOAD_BASE', 'https://pkp.sfu.ca/software/ojs/download/'); // URL dasar download OJS
-
+// ============================================================
 // INISIALISASI
-
+// ============================================================
 @set_time_limit(MAX_EXEC_SECONDS);
 @ini_set('memory_limit', '512M');
 session_start();
@@ -33,7 +35,9 @@ $errors  = [];
 $success = [];
 $info    = [];
 
+// ============================================================
 // FUNGSI-FUNGSI UTAMA
+// ============================================================
 
 /**
  * Verifikasi password
@@ -612,6 +616,295 @@ function runOjsDbUpgrade(string $ojsRoot): array {
     return $result;
 }
 
+
+// ============================================================
+// FUNGSI VERSI OJS & DOWNLOAD
+// ============================================================
+
+/**
+ * Daftar versi OJS yang diketahui (hardcoded, sebagai fallback)
+ * Format: 'X.Y.Z-N' => [tanggal, is_lts, php_min, label, catatan]
+ */
+function getKnownOjsVersions(): array {
+    return [
+        // ── OJS 3.5 ────────────────────────────────────────────
+        '3.5.0-4'  => ['2026-04-09', false, '8.2', 'Latest Stable', 'Rilis terbaru, belum LTS'],
+        '3.5.0-3'  => ['2025-12-11', false, '8.2', '',              ''],
+        '3.5.0-2'  => ['2025-10-30', false, '8.2', '',              ''],
+        '3.5.0-1'  => ['2025-10-09', false, '8.2', '',              ''],
+        '3.5.0-0'  => ['2025-09-23', false, '8.2', '',              ''],
+        // ── OJS 3.4 (LTS) ──────────────────────────────────────
+        '3.4.0-10' => ['2025-11-21', true,  '8.0', 'LTS',          'Didukung s/d Jan 2027'],
+        '3.4.0-9'  => ['2025-08-05', true,  '8.0', 'LTS',          ''],
+        '3.4.0-8'  => ['2025-04-01', false, '8.0', '',              ''],
+        '3.4.0-7'  => ['2024-12-16', false, '8.0', '',              ''],
+        '3.4.0-6'  => ['2024-09-12', false, '8.0', '',              ''],
+        '3.4.0-5'  => ['2024-06-04', false, '8.0', '',              ''],
+        // ── OJS 3.3 (Legacy / EOL) ─────────────────────────────
+        '3.3.0-19' => ['2024-06-04', false, '7.3', 'Legacy EOL',   'End of life'],
+        '3.3.0-18' => ['2024-01-25', false, '7.3', '',              ''],
+        '3.3.0-17' => ['2023-10-17', false, '7.3', '',              ''],
+        '3.3.0-16' => ['2023-08-08', false, '7.3', '',              ''],
+    ];
+}
+
+/**
+ * Coba ambil versi terbaru dari halaman PKP secara live (opsional)
+ */
+function tryFetchLiveOjsVersions(): array {
+    $ctx = stream_context_create(['http' => [
+        'timeout'      => 8,
+        'user_agent'   => 'OJS-Updater/1.0 (admin tool)',
+        'ignore_errors'=> true,
+    ]]);
+
+    $found = [];
+    $urls  = [
+        'https://pkp.sfu.ca/software/ojs/download/',
+        'https://pkp.sfu.ca/software/ojs/download/archive/',
+    ];
+    foreach ($urls as $url) {
+        $html = @file_get_contents($url, false, $ctx);
+        if (!$html) continue;
+        if (preg_match_all('/ojs-(3\.\d+\.\d+-\d+)\.tar\.gz/i', $html, $m)) {
+            foreach ($m[1] as $v) $found[$v] = true;
+        }
+    }
+    return array_keys($found);
+}
+
+/**
+ * Gabungkan versi hardcoded + live fetch, diurutkan descending
+ */
+function getAllOjsVersions(): array {
+    $known = getKnownOjsVersions();
+    $live  = tryFetchLiveOjsVersions();
+
+    foreach ($live as $v) {
+        if (!isset($known[$v])) {
+            $phpMin = '7.3';
+            if (version_compare($v, '3.4.0', '>=')) $phpMin = '8.0';
+            if (version_compare($v, '3.5.0', '>=')) $phpMin = '8.2';
+            $known[$v] = ['', false, $phpMin, 'Live PKP', ''];
+        }
+    }
+
+    uksort($known, fn($a, $b) => version_compare($b, $a));
+    return $known;
+}
+
+/**
+ * Cek apakah versi OJS kompatibel dengan PHP saat ini
+ * Return: ['ok'=>bool, 'php_min'=>str, 'warning'=>str|null]
+ */
+function checkPhpCompatibility(string $ojsVersion): array {
+    $known   = getKnownOjsVersions();
+    $phpMin  = $known[$ojsVersion][2] ?? '7.3';
+    $current = PHP_VERSION;
+    $ok      = version_compare($current, $phpMin, '>=');
+
+    // OJS 3.3 hanya diuji s/d PHP 8.1
+    $warning = null;
+    if (version_compare($ojsVersion, '3.3.0', '>=') && version_compare($ojsVersion, '3.4.0', '<')) {
+        if (version_compare($current, '8.2', '>=')) {
+            $warning = "PHP {$current} belum diuji resmi untuk OJS 3.3. Disarankan PHP ≤ 8.1.";
+        }
+    }
+
+    return ['ok' => $ok, 'php_min' => $phpMin, 'warning' => $warning, 'current' => $current];
+}
+
+/**
+ * Klasifikasi tipe upgrade: reinstall | patch | minor | major | downgrade
+ */
+function classifyUpgrade(string $currentVer, string $targetVer): string {
+    /**
+     * Normalisasi berbagai format versi OJS ke "X.Y.Z-N":
+     *   "3.3.0.19"  → "3.3.0-19"
+     *   "3.3.0-19"  → "3.3.0-19"  (sudah benar)
+     *   "3.3.0 19"  → "3.3.0-19"  (spasi)
+     *   "3.3.0"     → "3.3.0-0"   (tanpa build number)
+     */
+    $normalize = function(string $v): string {
+        $v = trim($v);
+        // Format: X.Y.Z.N atau X.Y.Z-N atau X.Y.Z N
+        if (preg_match('/^(\d+)\.(\d+)\.(\d+)[.\-\s](\d+)$/', $v, $m)) {
+            return "{$m[1]}.{$m[2]}.{$m[3]}-{$m[4]}";
+        }
+        // Format: X.Y.Z tanpa build
+        if (preg_match('/^(\d+)\.(\d+)\.(\d+)$/', $v, $m)) {
+            return "{$m[1]}.{$m[2]}.{$m[3]}-0";
+        }
+        return $v; // Kembalikan apa adanya jika tidak cocok
+    };
+
+    $currentVer = $normalize($currentVer);
+    $targetVer  = $normalize($targetVer);
+
+    $cParts = explode('-', $currentVer, 2);
+    $tParts = explode('-', $targetVer,  2);
+    $cBase  = array_map('intval', explode('.', $cParts[0] ?? '0.0.0'));
+    $tBase  = array_map('intval', explode('.', $tParts[0] ?? '0.0.0'));
+
+    $cBuild = (int)($cParts[1] ?? 0);
+    $tBuild = (int)($tParts[1] ?? 0);
+
+    // Bandingkan major.minor.patch
+    $cM = $cBase[0] ?? 0; $tM = $tBase[0] ?? 0;
+    $cN = $cBase[1] ?? 0; $tN = $tBase[1] ?? 0;
+    $cP = $cBase[2] ?? 0; $tP = $tBase[2] ?? 0;
+
+    if ($cM !== $tM) return $tM > $cM ? 'major'    : 'downgrade';
+    if ($cN !== $tN) return $tN > $cN ? 'minor'    : 'downgrade';
+    if ($cP !== $tP) return $tP > $cP ? 'patch'    : 'downgrade';
+    if ($cBuild === $tBuild) return 'reinstall';
+    return $tBuild > $cBuild ? 'patch' : 'downgrade';
+}
+
+/**
+ * Download OJS release langsung dari pkp.sfu.ca ke server
+ */
+function downloadOjsRelease(string $version, string $tmpDir): array {
+    $result = ['success' => false];
+
+    if (!preg_match('/^3\.\d+\.\d+-\d+$/', $version)) {
+        $result['error'] = 'Format versi tidak valid: ' . $version;
+        return $result;
+    }
+
+    $url      = "https://pkp.sfu.ca/ojs/download/ojs-{$version}.tar.gz";
+    $destFile = rtrim($tmpDir, '/') . "/ojs-{$version}.tar.gz";
+
+    if (!is_dir($tmpDir)) @mkdir($tmpDir, 0755, true);
+
+    $disabledFns = array_map('trim', explode(',', (string)ini_get('disable_functions')));
+
+    // Metode 1: curl CLI (paling reliable untuk file besar)
+    if (function_exists('exec') && !in_array('exec', $disabledFns)) {
+        $curlPath = trim((string)@shell_exec('which curl 2>/dev/null'));
+        if ($curlPath) {
+            $cmd = sprintf(
+                '%s -L --max-time 300 --retry 2 --silent -o %s %s',
+                escapeshellarg($curlPath),
+                escapeshellarg($destFile),
+                escapeshellarg($url)
+            );
+            exec($cmd . ' 2>&1', $out, $code);
+            if ($code === 0 && file_exists($destFile) && filesize($destFile) > 500000) {
+                $result['downloaded_via'] = 'curl';
+                goto extract_file;
+            }
+        }
+    }
+
+    // Metode 2: wget CLI
+    if (function_exists('exec') && !in_array('exec', $disabledFns)) {
+        $wgetPath = trim((string)@shell_exec('which wget 2>/dev/null'));
+        if ($wgetPath) {
+            $cmd = sprintf(
+                '%s -q --timeout=300 -O %s %s',
+                escapeshellarg($wgetPath),
+                escapeshellarg($destFile),
+                escapeshellarg($url)
+            );
+            exec($cmd . ' 2>&1', $out, $code);
+            if ($code === 0 && file_exists($destFile) && filesize($destFile) > 500000) {
+                $result['downloaded_via'] = 'wget';
+                goto extract_file;
+            }
+        }
+    }
+
+    // Metode 3: PHP file_get_contents (last resort, bisa gagal untuk file besar)
+    if (ini_get('allow_url_fopen')) {
+        @set_time_limit(0);
+        $ctx  = stream_context_create(['http' => ['timeout' => 300, 'user_agent' => 'OJS-Updater/1.0']]);
+        $data = @file_get_contents($url, false, $ctx);
+        if ($data && strlen($data) > 500000) {
+            if (@file_put_contents($destFile, $data)) {
+                $result['downloaded_via'] = 'php';
+                goto extract_file;
+            }
+        }
+    }
+
+    $result['error'] = "Gagal mengunduh dari {$url}. Coba upload manual atau ekstrak via SSH.";
+    return $result;
+
+    extract_file:
+    $result['tar_file'] = $destFile;
+    $extractTo = $tmpDir . '/extracted_' . $version;
+    $extResult = extractTarGz($destFile, $extractTo);
+    @unlink($destFile);
+
+    if (!$extResult['success']) {
+        $result['error'] = 'Download OK tapi gagal ekstrak: ' . ($extResult['error'] ?? '');
+        return $result;
+    }
+
+    $result['success']    = true;
+    $result['extract_dir'] = $extResult['ojs_subdir'];
+    $result['version']    = $version;
+    return $result;
+}
+
+/**
+ * Ekstrak file .tar.gz ke direktori tujuan
+ */
+function extractTarGz(string $tarGzPath, string $destDir): array {
+    $result = ['success' => false];
+    if (!is_dir($destDir)) @mkdir($destDir, 0755, true);
+
+    $disabledFns = array_map('trim', explode(',', (string)ini_get('disable_functions')));
+
+    // Metode 1: tar CLI
+    if (function_exists('exec') && !in_array('exec', $disabledFns)) {
+        $tarPath = trim((string)@shell_exec('which tar 2>/dev/null'));
+        if ($tarPath) {
+            $cmd  = sprintf('%s xzf %s -C %s 2>&1', escapeshellarg($tarPath), escapeshellarg($tarGzPath), escapeshellarg($destDir));
+            exec($cmd, $out, $code);
+            if ($code === 0) {
+                $result['success'] = true;
+                $result['method']  = 'tar';
+                goto find_subdir;
+            }
+            $result['tar_output'] = implode("
+", $out);
+        }
+    }
+
+    // Metode 2: PharData
+    if (class_exists('PharData')) {
+        try {
+            $phar    = new PharData($tarGzPath);
+            $tarFile = preg_replace('/\.gz$/', '', $tarGzPath);
+            $phar->decompress();
+            $tar = new PharData($tarFile);
+            $tar->extractTo($destDir, null, true);
+            @unlink($tarFile);
+            $result['success'] = true;
+            $result['method']  = 'phar';
+            goto find_subdir;
+        } catch (Exception $e) {
+            $result['error'] = 'PharData: ' . $e->getMessage();
+        }
+    }
+
+    $result['error'] = 'Tidak ada metode ekstrak yang tersedia (tar CLI / PharData).';
+    return $result;
+
+    find_subdir:
+    $subdirs = glob($destDir . '/*', GLOB_ONLYDIR);
+    $ojsDir  = null;
+    foreach ($subdirs as $d) {
+        if (stripos(basename($d), 'ojs') !== false) { $ojsDir = $d; break; }
+    }
+    if (!$ojsDir && count($subdirs) === 1) $ojsDir = $subdirs[0];
+    $result['ojs_subdir'] = $ojsDir ?? $destDir;
+    return $result;
+}
+
+
 // ============================================================
 // PROSES FORM ACTIONS
 // ============================================================
@@ -709,6 +1002,26 @@ if ($action === 'run_upgrade' && checkAuth()) {
     }
 }
 
+// Handle download langsung dari PKP
+if ($action === 'download_version' && checkAuth()) {
+    $version = trim($_POST['ojs_version'] ?? '');
+    if (!preg_match('/^3\.\d+\.\d+-\d+$/', $version)) {
+        $errors[] = 'Format versi tidak valid: ' . htmlspecialchars($version);
+    } else {
+        @set_time_limit(0); // download butuh waktu lama
+        $tmpDir   = sys_get_temp_dir() . '/ojs_dl_' . date('YmdHis');
+        $dlResult = downloadOjsRelease($version, $tmpDir);
+        if ($dlResult['success']) {
+            $_SESSION['ojs_new_dir']      = $dlResult['extract_dir'];
+            $_SESSION['ojs_dl_version']   = $version;
+            $success[] = "OJS {$version} berhasil diunduh & diekstrak ke: " . $dlResult['extract_dir'];
+            $success[] = "Metode download: " . ($dlResult['downloaded_via'] ?? '-');
+        } else {
+            $errors[] = 'Download gagal: ' . ($dlResult['error'] ?? 'Unknown error');
+        }
+    }
+}
+
 // Handle set manual dir path
 if ($action === 'set_manual_dir' && checkAuth()) {
     $manualDir = trim($_POST['manual_dir'] ?? '');
@@ -720,8 +1033,9 @@ if ($action === 'set_manual_dir' && checkAuth()) {
     }
 }
 
+// ============================================================
 // KUMPULKAN INFO SISTEM
-
+// ============================================================
 $ojsConfig    = checkAuth() ? readOjsConfig(OJS_ROOT) : [];
 $ojsVersion   = checkAuth() ? detectOjsVersion(OJS_ROOT) : '-';
 $phpVersion   = PHP_VERSION;
@@ -735,6 +1049,9 @@ $preservedNow = checkAuth() ? getPreservedItems(OJS_ROOT) : [];
 // Scan diff hanya jika ZIP sudah diupload
 $scanDiff     = ($newOjsDir && is_dir($newOjsDir) && checkAuth())
                 ? scanRootDiff(OJS_ROOT, $newOjsDir) : null;
+// Versi OJS yang tersedia (dengan fallback hardcoded)
+$ojsVersions  = checkAuth() ? getAllOjsVersions() : [];
+$dlVersion    = $_SESSION['ojs_dl_version'] ?? null;
 
 ?>
 <!DOCTYPE html>
@@ -1243,6 +1560,79 @@ pre {
 .guide-step-text { font-size: 13px; color: var(--text-dim); line-height: 1.5; }
 .guide-step-text strong { color: var(--text); }
 
+/* ─── VERSION PICKER ─── */
+.ver-tabs { display: flex; gap: 4px; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 0; }
+.ver-tab {
+  padding: 8px 16px; font-size: 12px; font-weight: 500;
+  border: 1px solid transparent; border-bottom: none;
+  border-radius: var(--r) var(--r) 0 0;
+  cursor: pointer; color: var(--text-faint);
+  background: none; font-family: 'Outfit', sans-serif;
+  position: relative; bottom: -1px;
+  transition: all .15s;
+}
+.ver-tab:hover  { color: var(--text); background: var(--surface2); }
+.ver-tab.active { color: var(--gold); background: var(--surface); border-color: var(--border); border-bottom-color: var(--surface); }
+.ver-panel { display: none; }
+.ver-panel.active { display: block; }
+
+.ver-group { margin-bottom: 20px; }
+.ver-group-title {
+  font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .1em; color: var(--text-faint);
+  font-family: 'JetBrains Mono', monospace;
+  margin-bottom: 8px; padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 8px;
+}
+.ver-list { display: flex; flex-direction: column; gap: 4px; }
+
+.ver-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto;
+  align-items: center; gap: 12px;
+  padding: 10px 14px;
+  border-radius: var(--r);
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  cursor: pointer;
+  transition: all .15s;
+  position: relative;
+}
+.ver-row:hover:not(.incompatible) { border-color: var(--border-hi); background: var(--surface3); }
+.ver-row.selected  { border-color: var(--gold); background: rgba(212,148,58,.06); }
+.ver-row.incompatible { opacity: .45; cursor: not-allowed; }
+.ver-radio { appearance: none; width: 16px; height: 16px; border-radius: 50%; border: 1.5px solid var(--border-md); flex-shrink: 0; cursor: pointer; transition: all .15s; }
+.ver-radio:checked { background: var(--gold); border-color: var(--gold); box-shadow: inset 0 0 0 3px var(--surface2); }
+.ver-row.incompatible .ver-radio { cursor: not-allowed; }
+.ver-name { font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 500; color: var(--text); }
+.ver-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ver-date { font-size: 11px; color: var(--text-faint); font-family: 'JetBrains Mono', monospace; }
+.ver-badge {
+  font-size: 10px; font-weight: 600; padding: 1px 7px;
+  border-radius: 100px; letter-spacing: .04em; text-transform: uppercase;
+  font-family: 'JetBrains Mono', monospace;
+}
+.vb-lts     { background: rgba(74,222,128,.12); color: var(--mint);   border: 1px solid rgba(74,222,128,.3); }
+.vb-latest  { background: rgba(212,148,58,.12); color: var(--gold);   border: 1px solid rgba(212,148,58,.3); }
+.vb-legacy  { background: rgba(248,113,113,.1); color: var(--coral);  border: 1px solid rgba(248,113,113,.2); }
+.vb-current { background: rgba(125,211,252,.1); color: var(--sky);    border: 1px solid rgba(125,211,252,.25); }
+.ver-compat { font-size: 11px; font-family: 'JetBrains Mono', monospace; white-space: nowrap; }
+.vc-ok  { color: var(--mint); }
+.vc-bad { color: var(--coral); }
+.vc-warn { color: var(--amber); }
+.ver-upgrade-badge {
+  font-size: 10px; padding: 2px 7px; border-radius: 100px;
+  font-family: 'JetBrains Mono', monospace; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .04em;
+  white-space: nowrap;
+}
+.vub-reinstall { background: var(--sky-dim);   color: var(--sky);   border: 1px solid rgba(125,211,252,.2); }
+.vub-patch     { background: var(--mint-dim);  color: var(--mint);  border: 1px solid rgba(74,222,128,.2); }
+.vub-minor     { background: var(--gold-dim);  color: var(--gold);  border: 1px solid rgba(212,148,58,.2); }
+.vub-major     { background: var(--coral-dim); color: var(--coral); border: 1px solid rgba(248,113,113,.2); }
+.vub-downgrade { background: var(--surface3);  color: var(--text-faint); border: 1px solid var(--border-md); }
+
 /* ─── RESPONSIVE ─── */
 @media (max-width: 600px) {
   .container { padding: 20px 14px 50px; }
@@ -1268,7 +1658,7 @@ pre {
     <div class="header-icon">⚙</div>
     <div>
       <div class="header-title">OJS <span>Core</span> Updater</div>
-      <div class="header-sub">Easy update · reinstall · your OJS system </div>
+      <div class="header-sub">update · reinstall · no data loss</div>
     </div>
   </div>
   <?php if (checkAuth()): ?>
@@ -1466,67 +1856,241 @@ pre {
   </div>
 
   <?php elseif ($step == 3): ?>
-  <!-- ═══════════ STEP 3: UPLOAD ZIP ═══════════ -->
+  <!-- ═══════════ STEP 3: PILIH VERSI ═══════════ -->
   <div class="card">
     <div class="card-head">
-      <div class="card-head-icon">⬆</div>
+      <div class="card-head-icon">📦</div>
       <div>
-        <h2>Upload File OJS Baru</h2>
-        <small>zip package · pkp.sfu.ca</small>
+        <h2>Siapkan File OJS Baru</h2>
+        <small>pilih versi · download · atau upload manual</small>
       </div>
     </div>
     <div class="card-body">
 
-      <div class="callout callout-info" style="margin-bottom:18px;">
-        <span class="callout-ico">ℹ</span>
-        <div>Download ZIP dari
-          <a href="https://pkp.sfu.ca/software/ojs/download/" target="_blank"
-             style="color:var(--sky);">pkp.sfu.ca/software/ojs/download/</a> —
-          pastikan versi sesuai dengan yang ingin diinstall/update.</div>
-      </div>
-
       <?php if ($newOjsDir): ?>
       <div class="callout callout-ok" style="margin-bottom:16px;">
         <span class="callout-ico">✓</span>
-        <div>ZIP diekstrak ke: <code><?= htmlspecialchars($newOjsDir) ?></code></div>
+        <div>
+          <?php if ($dlVersion): ?>
+            OJS <strong><?= htmlspecialchars($dlVersion) ?></strong> sudah siap di:
+          <?php else: ?>
+            File OJS sudah siap di:
+          <?php endif; ?>
+          <code><?= htmlspecialchars($newOjsDir) ?></code>
+        </div>
       </div>
       <?php endif; ?>
 
-      <form method="post" enctype="multipart/form-data" style="display:block">
-        <input type="hidden" name="action" value="upload_zip">
-        <div class="form-group">
-          <label>Upload File ZIP OJS</label>
-          <input type="file" name="ojs_zip" accept=".zip">
-          <p class="form-hint">Upload limit: <code><?= $maxUpload ?></code>.
-            Jika terlalu besar, naikkan <code>upload_max_filesize</code> di php.ini.</p>
-        </div>
-        <button type="submit" class="btn btn-primary">⬆ Upload & Ekstrak</button>
-      </form>
-
-      <div class="divider" style="margin:22px 0 18px">
-        <span class="divider-label">atau ekstrak manual</span>
+      <!-- TABS -->
+      <div class="ver-tabs" id="verTabs">
+        <button class="ver-tab active" onclick="switchTab('auto',this)">🌐 Download Otomatis</button>
+        <button class="ver-tab" onclick="switchTab('upload',this)">⬆ Upload Manual</button>
+        <button class="ver-tab" onclick="switchTab('path',this)">📂 Path Server</button>
       </div>
 
-      <div class="callout callout-info" style="margin-bottom:14px;">
-        <span class="callout-ico">💡</span>
-        <div>Untuk file besar, ekstrak ZIP via SSH ke <code>/tmp/ojs_new/</code>
-          lalu masukkan path direktori di bawah.</div>
-      </div>
+      <!-- ══ TAB: DOWNLOAD OTOMATIS ══ -->
+      <div class="ver-panel active" id="tab-auto">
 
-      <form method="post" style="display:block">
-        <input type="hidden" name="action" value="set_manual_dir">
-        <div class="form-group">
-          <label>Path Direktori OJS (hasil ekstrak)</label>
-          <input type="text" name="manual_dir"
-                 placeholder="/tmp/ojs_new/ojs-3.4.0-7"
-                 value="<?= htmlspecialchars($_SESSION['ojs_new_dir'] ?? '') ?>">
-          <p class="form-hint">Folder ini harus berisi <code>index.php</code> OJS langsung di dalamnya.</p>
+        <?php
+          // Grup versi berdasarkan minor (3.5, 3.4, 3.3, dst)
+          $verGroups = [];
+          foreach ($ojsVersions as $ver => $meta) {
+              [$vDate, $vLts, $vPhpMin, $vLabel, $vNotes] = $meta;
+              preg_match('/^(\d+\.\d+)/', $ver, $m);
+              $group = $m[1] ?? $ver;
+              $verGroups[$group][$ver] = $meta;
+          }
+          $currentVer = $ojsVersion ?? 'Tidak diketahui';
+        ?>
+
+        <?php if (!extension_loaded('openssl') && !function_exists('curl_init')): ?>
+        <div class="callout callout-warn" style="margin-bottom:14px;">
+          <span class="callout-ico">⚠</span>
+          <div>cURL dan OpenSSL tidak terdeteksi. Download otomatis mungkin gagal.
+          Gunakan tab Upload Manual atau Path Server sebagai alternatif.</div>
         </div>
-        <button type="submit" class="btn btn-ghost btn-sm">📂 Gunakan Path Ini</button>
-      </form>
+        <?php endif; ?>
 
+        <form method="post" style="display:block" id="dlForm">
+          <input type="hidden" name="action" value="download_version">
+
+          <?php foreach ($verGroups as $group => $groupVersions): ?>
+          <?php
+            $groupMeta = reset($groupVersions);
+            $isLtsGroup   = false;
+            $groupLabel   = "OJS {$group}";
+            foreach ($groupVersions as $v => $m) { if ($m[1]) { $isLtsGroup = true; break; } }
+            $phpMinGroup = reset($groupVersions)[2] ?? '7.3';
+            $groupOk = version_compare(PHP_VERSION, $phpMinGroup, '>=');
+          ?>
+          <div class="ver-group">
+            <div class="ver-group-title">
+              OJS <?= $group ?>
+              <?php if ($isLtsGroup): ?><span class="ver-badge vb-lts">LTS</span><?php endif; ?>
+              <span style="font-weight:400;color:var(--text-faint);">PHP <?= $phpMinGroup ?>+</span>
+              <?php if (!$groupOk): ?>
+                <span class="ver-badge vb-legacy">PHP Anda <?= PHP_VERSION ?> tidak kompatibel</span>
+              <?php endif; ?>
+            </div>
+            <div class="ver-list">
+              <?php foreach ($groupVersions as $ver => $meta): ?>
+              <?php
+                // Defensive destructuring — pastikan $meta punya 5 elemen
+                $vDate    = $meta[0] ?? '';
+                $vLts     = $meta[1] ?? false;
+                $vPhpMin  = $meta[2] ?? '7.3';
+                $vLabel   = $meta[3] ?? '';
+                $vNotes   = $meta[4] ?? '';
+
+                $compat     = checkPhpCompatibility($ver);
+                $isIncompat = !$compat['ok'];
+
+                // Deteksi versi saat ini (normalisasi format)
+                $verDot  = str_replace('-', '.', $ver);
+                $curDot  = str_replace('-', '.', $currentVer);
+                $isCurrent = ($verDot === $curDot
+                              || $ver === $currentVer
+                              || str_contains($curDot, $verDot));
+
+                // Klasifikasi upgrade
+                try {
+                  $upgradeType = classifyUpgrade($currentVer, $ver);
+                } catch (Throwable $e) {
+                  $upgradeType = 'unknown';
+                }
+
+                $upgradeMap   = [
+                  'reinstall' => ['vub-reinstall', 'Reinstall'],
+                  'patch'     => ['vub-patch',     'Patch'],
+                  'minor'     => ['vub-minor',     'Upgrade Minor'],
+                  'major'     => ['vub-major',     'Upgrade Major'],
+                  'downgrade' => ['vub-downgrade', 'Downgrade'],
+                ];
+                $upgradeLabel = $upgradeMap[$upgradeType] ?? ['vub-reinstall', ucfirst($upgradeType)];
+              ?>
+              <label class="ver-row <?= $isIncompat ? 'incompatible' : '' ?>" style="cursor:<?= $isIncompat?'not-allowed':'pointer' ?>">
+                <input type="radio" name="ojs_version" value="<?= htmlspecialchars($ver) ?>"
+                       class="ver-radio" <?= $isIncompat ? 'disabled' : '' ?>
+                       onchange="document.querySelector('#dlForm .btn-primary').disabled=false;">
+                <div>
+                  <div class="ver-name">
+                    <?= htmlspecialchars($ver) ?>
+                    <?php if ($isCurrent): ?><span class="ver-badge vb-current" style="margin-left:6px;">Versi Saat Ini</span><?php endif; ?>
+                  </div>
+                  <div class="ver-meta" style="margin-top:3px;">
+                    <?php if ($vDate): ?><span class="ver-date"><?= htmlspecialchars($vDate) ?></span><?php endif; ?>
+                    <?php if ($vLts):  ?><span class="ver-badge vb-lts">LTS</span><?php endif; ?>
+                    <?php if ($vLabel === 'Latest Stable'): ?><span class="ver-badge vb-latest">Latest</span><?php endif; ?>
+                    <?php if (strpos($vLabel,'Legacy') !== false || strpos($vLabel,'EOL') !== false): ?>
+                      <span class="ver-badge vb-legacy">Legacy EOL</span>
+                    <?php endif; ?>
+                    <?php if ($vNotes): ?><span class="ver-date"><?= htmlspecialchars($vNotes) ?></span><?php endif; ?>
+                  </div>
+                </div>
+                <span class="ver-upgrade-badge <?= $upgradeLabel[0] ?>"><?= $upgradeLabel[1] ?></span>
+                <span class="ver-compat">
+                  <?php if ($isIncompat): ?>
+                    <span class="vc-bad">✕ PHP <?= $vPhpMin ?>+ diperlukan</span>
+                  <?php elseif ($compat['warning']): ?>
+                    <span class="vc-warn">⚠ <?= htmlspecialchars($compat['warning']) ?></span>
+                  <?php else: ?>
+                    <span class="vc-ok">✓ PHP OK</span>
+                  <?php endif; ?>
+                </span>
+              </label>
+              <?php endforeach; ?>
+            </div>
+          </div>
+          <?php endforeach; ?>
+
+          <div style="margin-top:20px;">
+            <button type="submit" class="btn btn-primary" id="dlBtn" disabled
+                    onclick="return confirm('Download OJS ke server? Proses ini bisa memakan 1-3 menit tergantung koneksi server.')">
+              ⬇ Download & Siapkan ke Server
+            </button>
+            <span style="font-size:11.5px;color:var(--text-faint);margin-left:12px;">
+              File diunduh langsung ke <code>/tmp/</code> server, tidak melewati browser Anda.
+            </span>
+          </div>
+        </form>
+
+        <div class="callout callout-info" style="margin-top:16px;">
+          <span class="callout-ico">ℹ</span>
+          <div>
+            URL unduhan: <code>https://pkp.sfu.ca/ojs/download/ojs-<em>[versi]</em>.tar.gz</code><br>
+            Format: <code>.tar.gz</code> (~55MB). Pastikan server bisa mengakses internet.
+            Jika gagal, gunakan tab Upload Manual.
+          </div>
+        </div>
+
+        <?php if ($currentVer && $currentVer !== 'Tidak diketahui'): ?>
+        <div class="callout callout-gold" style="margin-top:12px;">
+          <span class="callout-ico">💡</span>
+          <div>
+            <strong>Rekomendasi upgrade dari <?= htmlspecialchars($currentVer) ?>:</strong><br>
+            OJS merekomendasikan upgrade <strong>satu versi minor sekaligus</strong>.
+            Contoh: 3.3 → 3.4 terlebih dahulu, baru 3.4 → 3.5.<br>
+            <span style="font-size:11.5px;">Lewati versi (<em>3.3 langsung ke 3.5</em>) bisa menyebabkan error migrasi database.</span>
+          </div>
+        </div>
+        <?php endif; ?>
+
+      </div><!-- /tab-auto -->
+
+      <!-- ══ TAB: UPLOAD MANUAL ══ -->
+      <div class="ver-panel" id="tab-upload">
+        <div class="callout callout-info" style="margin-bottom:16px;">
+          <span class="callout-ico">ℹ</span>
+          <div>
+            Download <code>.tar.gz</code> dari
+            <a href="https://pkp.sfu.ca/software/ojs/download/" target="_blank" style="color:var(--sky);">pkp.sfu.ca</a>
+            ke komputer Anda, lalu upload di sini. Maksimal upload: <code><?= $maxUpload ?></code>.
+          </div>
+        </div>
+
+        <form method="post" enctype="multipart/form-data" style="display:block">
+          <input type="hidden" name="action" value="upload_zip">
+          <div class="form-group">
+            <label>Upload File OJS (.tar.gz atau .zip)</label>
+            <input type="file" name="ojs_zip" accept=".zip,.tar.gz,.gz">
+            <p class="form-hint">
+              Jika ukuran melebihi limit upload, naikkan <code>upload_max_filesize</code>
+              dan <code>post_max_size</code> di <code>php.ini</code>.
+            </p>
+          </div>
+          <button type="submit" class="btn btn-primary">⬆ Upload & Ekstrak</button>
+        </form>
+      </div><!-- /tab-upload -->
+
+      <!-- ══ TAB: PATH SERVER ══ -->
+      <div class="ver-panel" id="tab-path">
+        <div class="callout callout-info" style="margin-bottom:16px;">
+          <span class="callout-ico">💡</span>
+          <div>
+            Untuk file sangat besar, ekstrak langsung di server via SSH:<br>
+            <code>cd /tmp && wget https://pkp.sfu.ca/ojs/download/ojs-3.4.0-10.tar.gz</code><br>
+            <code>tar xzf ojs-3.4.0-10.tar.gz</code><br>
+            Lalu masukkan path hasilnya di bawah.
+          </div>
+        </div>
+
+        <form method="post" style="display:block">
+          <input type="hidden" name="action" value="set_manual_dir">
+          <div class="form-group">
+            <label>Path Direktori OJS (hasil ekstrak)</label>
+            <input type="text" name="manual_dir"
+                   placeholder="/tmp/ojs-3.4.0-10"
+                   value="<?= htmlspecialchars($_SESSION['ojs_new_dir'] ?? '') ?>">
+            <p class="form-hint">
+              Folder ini harus berisi <code>index.php</code> OJS langsung di dalamnya.
+            </p>
+          </div>
+          <button type="submit" class="btn btn-ghost btn-sm">📂 Gunakan Path Ini</button>
+        </form>
+      </div><!-- /tab-path -->
+
+      <!-- ══ SCAN DIFF (shared) ══ -->
       <?php if ($scanDiff): ?>
-      <!-- ─── SCAN DIFF ─── -->
       <div class="divider" style="margin:24px 0 20px">
         <span class="divider-label">analisis dampak update</span>
       </div>
@@ -1552,19 +2116,16 @@ pre {
         <div class="diff-section-title"><span style="color:var(--mint)">●</span> TIDAK TERSENTUH — hanya ada di instalasi Anda</div>
         <div class="chip-group">
           <?php foreach ($scanDiff['custom_only'] as $item): ?>
-            <?php $icon = $item['type']==='dir' ? '📁' : '📄'; $cls = 'chip-green';
+            <?php $icon = $item['type']==='dir'?'📁':'📄'; $cls='chip-green';
               if ($item['reason']==='script_ini') $cls='chip-coral';
               if ($item['reason']==='files_dir')  $cls='chip-amber'; ?>
-            <span class="chip <?= $cls ?>">
-              <span class="chip-dot"></span><?= $icon ?> <?= htmlspecialchars($item['name']) ?>
+            <span class="chip <?= $cls ?>"><span class="chip-dot"></span><?= $icon ?> <?= htmlspecialchars($item['name']) ?>
               <?php if ($item['reason']==='files_dir'): ?><em>(files_dir)</em><?php endif; ?>
               <?php if ($item['reason']==='script_ini'): ?><em>(script ini)</em><?php endif; ?>
             </span>
           <?php endforeach; ?>
         </div>
-        <p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">
-          Item-item ini tidak ada di ZIP baru → tidak diproses sama sekali.
-        </p>
+        <p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">Item-item ini tidak ada di versi baru → tidak diproses sama sekali.</p>
       </div>
       <?php endif; ?>
 
@@ -1573,36 +2134,22 @@ pre {
         <div class="diff-section-title"><span style="color:var(--sky)">●</span> DILINDUNGI — ada di ZIP tapi dilewati</div>
         <div class="chip-group">
           <?php foreach ($scanDiff['preserved'] as $item): ?>
-            <span class="chip chip-blue">
-              <span class="chip-dot"></span>
-              <?= $item['type']==='dir'?'📁':'📄' ?> <?= htmlspecialchars($item['name']) ?>
-            </span>
+            <span class="chip chip-blue"><span class="chip-dot"></span><?= $item['type']==='dir'?'📁':'📄' ?> <?= htmlspecialchars($item['name']) ?></span>
           <?php endforeach; ?>
         </div>
       </div>
       <?php endif; ?>
 
       <div class="diff-section">
-        <div class="diff-section-title">
-          <span style="color:var(--amber)">●</span>
-          AKAN DIGANTI/DITAMBAH — <?= count($scanDiff['will_replace']) + count($scanDiff['new_only']) ?> item
-        </div>
+        <div class="diff-section-title"><span style="color:var(--amber)">●</span> AKAN DIGANTI — <?= count($scanDiff['will_replace']) + count($scanDiff['new_only']) ?> item</div>
         <div class="chip-group">
           <?php foreach ($scanDiff['will_replace'] as $item): ?>
-            <span class="chip chip-amber"
-                  title="<?= $item['action']==='merge'?'Di-merge':'Diganti' ?>">
-              <span class="chip-dot"></span>
-              <?= $item['type']==='dir'?'📁':'📄' ?>
-              <?= htmlspecialchars($item['name']) ?>
-              <?= $item['action']==='merge' ? ' ⚡' : '' ?>
+            <span class="chip chip-amber" title="<?= $item['action']==='merge'?'Di-merge':'Diganti' ?>">
+              <span class="chip-dot"></span><?= $item['type']==='dir'?'📁':'📄' ?> <?= htmlspecialchars($item['name']) ?><?= $item['action']==='merge'?' ⚡':'' ?>
             </span>
           <?php endforeach; ?>
           <?php foreach ($scanDiff['new_only'] as $item): ?>
-            <span class="chip chip-muted" title="Item baru">
-              <span class="chip-dot"></span>
-              <?= $item['type']==='dir'?'📁':'📄' ?>
-              <?= htmlspecialchars($item['name']) ?> <em style="font-size:10px">+baru</em>
-            </span>
+            <span class="chip chip-muted"><span class="chip-dot"></span><?= $item['type']==='dir'?'📁':'📄' ?> <?= htmlspecialchars($item['name']) ?> <em style="font-size:10px">+baru</em></span>
           <?php endforeach; ?>
         </div>
       </div>
@@ -1616,6 +2163,26 @@ pre {
       <?php endif; ?>
     </div>
   </div>
+  <script>
+  function switchTab(id, btn) {
+    document.querySelectorAll('.ver-panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.ver-tab').forEach(b => b.classList.remove('active'));
+    document.getElementById('tab-' + id).classList.add('active');
+    btn.classList.add('active');
+  }
+  document.querySelectorAll('.ver-row:not(.incompatible)').forEach(row => {
+    row.addEventListener('click', function(e) {
+      if (e.target.tagName === 'INPUT') return;
+      const radio = this.querySelector('.ver-radio');
+      if (radio && !radio.disabled) {
+        radio.checked = true;
+        radio.dispatchEvent(new Event('change'));
+        document.querySelectorAll('.ver-row').forEach(r => r.classList.remove('selected'));
+        this.classList.add('selected');
+      }
+    });
+  });
+  </script>
 
   <?php elseif ($step == 4): ?>
   <!-- ═══════════ STEP 4: APPLY ═══════════ -->
