@@ -594,42 +594,56 @@ function runOjsDbUpgrade(string $ojsRoot): array
     $paths  = [$ojsRoot . '/tools/upgrade.php', $ojsRoot . '/lib/pkp/tools/upgrade.php'];
     $tool   = null;
     foreach ($paths as $p) { if (file_exists($p)) { $tool = $p; break; } }
+    
     if (!$tool) {
-        $result['error'] = 'tools/upgrade.php tidak ditemukan. Jalankan manual via SSH: php tools/upgrade.php upgrade';
+        $result['error'] = 'tools/upgrade.php tidak ditemukan.';
         return $result;
     }
+
     $php = PHP_BINARY ?: 'php';
     $cmd = escapeshellarg($php) . ' ' . escapeshellarg($tool) . ' upgrade 2>&1';
 
-    // [FIX #17] Gunakan proc_open dengan cwd parameter, tidak perlu chdir()
-    $descriptors = [
-        0 => ['pipe', 'r'],
-        1 => ['pipe', 'w'],
-        2 => ['pipe', 'w'],
-    ];
-    $process = @proc_open($cmd, $descriptors, $pipes, $ojsRoot);
-    if (is_resource($process)) {
-        fclose($pipes[0]);
-        $output = stream_get_contents($pipes[1]);
-        fclose($pipes[1]);
-        fclose($pipes[2]);
-        $code = proc_close($process);
-        $result['output']      = $output;
-        $result['return_code'] = $code;
-        $result['success']     = ($code === 0);
-        if (!$result['success']) $result['error'] = 'Exit code: ' . $code;
-    } else {
-        // Fallback ke exec() dengan chdir jika proc_open tidak tersedia
+    // Cek apakah proc_open tersedia dan tidak di-disable
+    $procOpenEnabled = function_exists('proc_open') && !in_array('proc_open', array_map('trim', explode(',', ini_get('disable_functions'))));
+    
+    if ($procOpenEnabled) {
+        $descriptors = [
+            0 => ['pipe', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
+        ];
+        $process = @proc_open($cmd, $descriptors, $pipes, $ojsRoot);
+        if (is_resource($process)) {
+            fclose($pipes[0]);
+            $output = stream_get_contents($pipes[1]);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            $code = proc_close($process);
+            $result['output']      = $output;
+            $result['return_code'] = $code;
+            $result['success']     = ($code === 0);
+            if (!$result['success']) $result['error'] = 'Exit code: ' . $code;
+            return $result;
+        }
+    }
+
+    // Fallback ke exec() jika proc_open tidak bisa
+    if (canExecCli()) {
         $cwd = getcwd();
         chdir($ojsRoot);
-        $out = []; // [FIX #11]
+        $out = [];
         exec($cmd, $out, $code);
         chdir($cwd);
         $result['output']      = implode("\n", $out);
         $result['return_code'] = $code;
         $result['success']     = ($code === 0);
         if (!$result['success']) $result['error'] = 'Exit code: ' . $code;
+        return $result;
     }
+
+    // Jika SEMUANYA di-disable (Shared hosting ketat)
+    $result['error'] = "Server memblokir proc_open dan exec. Jalankan manual via SSH/Terminal:\n";
+    $result['error'] .= "cd " . $ojsRoot . " && php tools/upgrade.php upgrade";
     return $result;
 }
 
